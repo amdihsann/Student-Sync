@@ -1,0 +1,12 @@
+# Environments
+.env
+.venv/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Kredensial GCP (Wajib disembunyikan!)
+credentials.json
