@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from agent import analyze_intent_with_groq
 from tools_finance import append_finance_data
 from tools_calendar import create_calendar_event
+from tools_task import append_task_row
 
 load_dotenv()
 
@@ -19,6 +20,16 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 _BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _TELEGRAM_API_BASE = f"https://api.telegram.org/bot{_BOT_TOKEN}"
+
+_raw_authorized_id = os.getenv("AUTHORIZED_CHAT_ID", "")
+try:
+    _AUTHORIZED_CHAT_ID: int | None = int(_raw_authorized_id)
+except ValueError:
+    _AUTHORIZED_CHAT_ID = None
+    logger.warning(
+        "AUTHORIZED_CHAT_ID is not set or not a valid integer — "
+        "all incoming messages will be rejected."
+    )
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Student-Sync", version="1.0.0")
@@ -66,8 +77,22 @@ async def _dispatch_action(action: dict) -> str:
         return f"⚠️ *Gagal mencatat keuangan:* `{result.get('error', 'unknown error')}`"
 
     if tool == "SHEET_TASK":
-        # TODO: implement tools_task.py and call append_task_data(payload) here
-        pass
+        try:
+            result = await append_task_row(payload)
+            if result.get("success"):
+                row = result["row"]
+                return (
+                    f"📋 *Tugas dicatat!*\n"
+                    f"• Tanggal   : {row[0]}\n"
+                    f"• Nama Tugas: {row[1]}\n"
+                    f"• Prioritas : {row[2]}\n"
+                    f"• Deadline  : {row[3]}\n"
+                    f"• Status    : {row[4]}"
+                )
+            return f"⚠️ *Gagal mencatat tugas:* `{result.get('error', 'unknown error')}`"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Unhandled exception in SHEET_TASK dispatch: %s", exc)
+            return f"⚠️ *Gagal mencatat tugas karena kesalahan tidak terduga:* `{exc}`"
 
     if tool == "CALENDAR_EVENT":
         try:
@@ -158,10 +183,16 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse(content={"status": "ok"})
 
     chat_id: int = message.get("chat", {}).get("id")
+
+    # ── Security check — silently drop requests from unauthorized users ───────
+    if _AUTHORIZED_CHAT_ID is None or chat_id != _AUTHORIZED_CHAT_ID:
+        logger.warning("Unauthorized access attempt from chat_id=%s — ignored.", chat_id)
+        return JSONResponse(content={"status": "ignored"})
+
     text: str = message.get("text", "").strip()
 
     # Ignore non-text updates (stickers, photos, voice, etc.)
-    if not chat_id or not text:
+    if not text:
         return JSONResponse(content={"status": "ok"})
 
     # Delegate to background — endpoint returns immediately
