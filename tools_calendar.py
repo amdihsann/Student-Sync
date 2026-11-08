@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta
 from functools import partial
+from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -45,6 +47,112 @@ def _insert_event(event_body: dict) -> dict:
     # .execute() is also blocking — wrap both build+execute in one thread call
     return insert_fn().execute()
 
+
+# ── Read ──────────────────────────────────────────────────────────────────────
+
+def _get_calendar_data_sync(payload: dict) -> list[dict]:
+    """
+    List events on the personal calendar based on payload.
+
+    Supports two modes:
+      - Single day : payload = {"tanggal": "YYYY-MM-DD", "rentang": ""}
+                     Fetches events for that specific date only.
+      - Upcoming   : payload = {"tanggal": "", "rentang": "upcoming"}
+                     Fetches events from today through the next 7 days.
+      - Default    : empty/missing payload → same as today (single day)
+
+    Blocking — always call via asyncio.to_thread().
+    """
+    if not _CALENDAR_ID:
+        raise ValueError("CALENDAR_ID environment variable is not set.")
+
+    tz_jakarta = ZoneInfo("Asia/Jakarta")
+    today = datetime.now(tz_jakarta).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    rentang: str = payload.get("rentang", "") or ""
+    tanggal: str = payload.get("tanggal", "") or ""
+
+    if rentang.lower() == "upcoming":
+        # timeMin = today 00:00, timeMax = today+7 23:59:59
+        time_min = today.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+        time_max = (today + timedelta(days=7)).replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+    else:
+        # Single day: use tanggal if provided, otherwise default to today
+        if tanggal:
+            target_date = datetime.strptime(tanggal, "%Y-%m-%d").replace(tzinfo=tz_jakarta)
+        else:
+            target_date = today
+        time_min = target_date.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+        time_max = target_date.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+
+    creds = Credentials.from_service_account_file(_CREDENTIALS_PATH, scopes=_SCOPES)
+    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+    response = (
+        service.events()
+        .list(
+            calendarId=_CALENDAR_ID,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+
+    events: list[dict] = []
+    for item in response.get("items", []):
+        start = item.get("start", {})
+        end   = item.get("end", {})
+        events.append({
+            "summary": item.get("summary", "(Tanpa Judul)"),
+            "start":   start.get("dateTime") or start.get("date", ""),
+            "end":     end.get("dateTime")   or end.get("date", ""),
+        })
+
+    return events
+
+
+async def get_calendar_data(payload: dict) -> dict:
+    """
+    Async wrapper — fetch calendar events based on payload.
+
+    Expected payload keys:
+        tanggal (str) : "YYYY-MM-DD" for a specific day (empty = today)
+        rentang (str) : "upcoming" to fetch events for the next 7 days
+
+    Returns:
+        {"success": True,  "data": [...], "mode": "single"|"upcoming"}
+        {"success": False, "error": "<reason>"}
+    """
+    try:
+        events = await asyncio.to_thread(_get_calendar_data_sync, payload)
+        mode = "upcoming" if (payload.get("rentang") or "").lower() == "upcoming" else "single"
+        logger.info("Fetched %d calendar events (mode=%s)", len(events), mode)
+        return {"success": True, "data": events, "mode": mode}
+
+    except ValueError as exc:
+        msg = str(exc)
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except FileNotFoundError:
+        msg = f"credentials.json tidak ditemukan di '{_CREDENTIALS_PATH}'"
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except HttpError as exc:
+        msg = f"Google Calendar API error {exc.status_code}: {exc.reason}"
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except Exception as exc:  # noqa: BLE001
+        msg = f"Unexpected error saat membaca calendar: {exc}"
+        logger.exception(msg)
+        return {"success": False, "error": msg}
+
+
+# ── Write ─────────────────────────────────────────────────────────────────────
 
 # ── Core Tool ─────────────────────────────────────────────────────────────────
 

@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 
 from agent import analyze_intent_with_groq, synthesize_answer
 from tools_finance import append_finance_data, get_finance_data
-from tools_calendar import create_calendar_event
+from tools_calendar import create_calendar_event, get_calendar_data
 from tools_task import append_task_row, get_task_data
 
 load_dotenv()
@@ -116,10 +116,11 @@ async def _dispatch_action(action: dict) -> str:
 
 # ── Background Task ───────────────────────────────────────────────────────────
 
-_READ_TOOLS = {"READ_FINANCE", "READ_TASK"}
+_READ_TOOLS = {"READ_FINANCE", "READ_TASK", "READ_CALENDAR"}
 _DATA_FETCHERS = {
-    "READ_FINANCE": get_finance_data,
-    "READ_TASK":    get_task_data,
+    "READ_FINANCE":  get_finance_data,
+    "READ_TASK":     get_task_data,
+    "READ_CALENDAR": get_calendar_data,
 }
 
 
@@ -130,9 +131,9 @@ async def process_and_reply(chat_id: int | str, user_text: str) -> None:
     WRITE path (SHEET_FINANCE / SHEET_TASK / CALENDAR_EVENT):
       Pass 1 → AI returns structured JSON → dispatch to tool → send response_text
 
-    READ path (READ_FINANCE / READ_TASK):
-      Pass 1 → AI returns READ intent (empty payload)
-      Pass 2 → fetch raw data from Sheets → feed to LLM → get natural-language answer
+    READ path (READ_FINANCE / READ_TASK / READ_CALENDAR):
+      Pass 1 → AI returns READ intent (with optional payload, e.g. tanggal for READ_CALENDAR)
+      Pass 2 → fetch data from Sheets/Calendar → feed to LLM → get natural-language answer
              → send that answer to Telegram
     """
     # ── Pass 1: intent routing ────────────────────────────────────────────────
@@ -169,7 +170,10 @@ async def process_and_reply(chat_id: int | str, user_text: str) -> None:
         if not fetcher:
             continue
         try:
-            result = await fetcher()
+            # Pass the action payload — READ_CALENDAR uses {"tanggal": "YYYY-MM-DD"},
+            # READ_FINANCE / READ_TASK ignore it (their fetchers accept no arguments).
+            action_payload: dict = action.get("payload") or {}
+            result = await fetcher(action_payload) if tool == "READ_CALENDAR" else await fetcher()
             if not result.get("success"):
                 read_outputs.append(
                     f"⚠️ Gagal mengambil data ({tool}): {result.get('error', 'unknown')}"
