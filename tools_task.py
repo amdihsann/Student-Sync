@@ -58,7 +58,60 @@ def _append_task_sync(payload: dict) -> list:
     return row
 
 
-# ── Async Wrapper ─────────────────────────────────────────────────────────────
+# ── Read ──────────────────────────────────────────────────────────────────────
+
+def _get_task_data_sync() -> list[dict]:
+    """
+    Open the 'Tasks' worksheet and return all rows as a list of dicts.
+    Blocking — always call via asyncio.to_thread().
+    """
+    creds = Credentials.from_service_account_file(_CREDENTIALS_PATH, scopes=_SCOPES)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open(_SPREADSHEET_NAME)
+    worksheet = spreadsheet.worksheet(_WORKSHEET_NAME)
+    return worksheet.get_all_records()
+
+
+async def get_task_data() -> dict:
+    """
+    Async wrapper — fetch all task records from Google Sheets.
+
+    Returns:
+        {"success": True,  "data": [{"Tanggal Dicatat": ..., "Nama Tugas": ..., ...}, ...]}
+        {"success": False, "error": "<reason>"}
+    """
+    try:
+        records: list[dict] = await asyncio.to_thread(_get_task_data_sync)
+        logger.info("Fetched %d task records.", len(records))
+        return {"success": True, "data": records}
+
+    except FileNotFoundError:
+        msg = f"credentials.json tidak ditemukan di '{_CREDENTIALS_PATH}'"
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except gspread.exceptions.SpreadsheetNotFound:
+        msg = f"Spreadsheet '{_SPREADSHEET_NAME}' tidak ditemukan. Periksa nama atau izin sharing."
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except gspread.exceptions.WorksheetNotFound:
+        msg = f"Worksheet '{_WORKSHEET_NAME}' tidak ditemukan di dalam '{_SPREADSHEET_NAME}'."
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except gspread.exceptions.APIError as exc:
+        msg = f"Google Sheets API error: {exc}"
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except Exception as exc:  # noqa: BLE001
+        msg = f"Unexpected error saat mengambil data tugas: {exc}"
+        logger.exception(msg)
+        return {"success": False, "error": msg}
+
+
+# ── Write ─────────────────────────────────────────────────────────────────────
 
 async def append_task_row(payload: dict) -> dict:
     """

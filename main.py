@@ -6,10 +6,10 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from agent import analyze_intent_with_groq
-from tools_finance import append_finance_data
+from agent import analyze_intent_with_groq, synthesize_answer
+from tools_finance import append_finance_data, get_finance_data
 from tools_calendar import create_calendar_event
-from tools_task import append_task_row
+from tools_task import append_task_row, get_task_data
 
 load_dotenv()
 
@@ -116,17 +116,28 @@ async def _dispatch_action(action: dict) -> str:
 
 # ── Background Task ───────────────────────────────────────────────────────────
 
+_READ_TOOLS = {"READ_FINANCE", "READ_TASK"}
+_DATA_FETCHERS = {
+    "READ_FINANCE": get_finance_data,
+    "READ_TASK":    get_task_data,
+}
+
+
 async def process_and_reply(chat_id: int | str, user_text: str) -> None:
     """
-    Core pipeline (runs in background — never blocks the event loop):
-      1. Call Groq AI to analyse intent and get structured actions.
-      2. Dispatch each action to the appropriate tool module.
-      3. Send the consolidated reply back to the user on Telegram.
+    2-step reasoning pipeline (runs in background — never blocks the event loop):
+
+    WRITE path (SHEET_FINANCE / SHEET_TASK / CALENDAR_EVENT):
+      Pass 1 → AI returns structured JSON → dispatch to tool → send response_text
+
+    READ path (READ_FINANCE / READ_TASK):
+      Pass 1 → AI returns READ intent (empty payload)
+      Pass 2 → fetch raw data from Sheets → feed to LLM → get natural-language answer
+             → send that answer to Telegram
     """
-    # ── Step 1: AI intent analysis ────────────────────────────────────────────
+    # ── Pass 1: intent routing ────────────────────────────────────────────────
     ai_result = await analyze_intent_with_groq(user_text)
 
-    # ── Step 2: Handle AI-level errors ───────────────────────────────────────
     if "error" in ai_result:
         error_msg = (
             f"⚠️ *Terjadi kesalahan saat memproses pesanmu.*\n"
@@ -139,25 +150,72 @@ async def process_and_reply(chat_id: int | str, user_text: str) -> None:
     actions: list = ai_result.get("actions", [])
     response_text: str = ai_result.get("response_text", "")
 
-    # ── Step 3: Dispatch each action and collect tool output lines ────────────
-    tool_outputs: list[str] = []
-    for action in actions:
-        output = await _dispatch_action(action)
-        if output:  # None means pass/not-yet-implemented
-            tool_outputs.append(output)
+    # ── Separate READ actions from WRITE actions ──────────────────────────────
+    read_actions  = [a for a in actions if a.get("tool", "").upper() in _READ_TOOLS]
+    write_actions = [a for a in actions if a.get("tool", "").upper() not in _READ_TOOLS]
 
-    # ── Step 4: Build final reply ─────────────────────────────────────────────
-    # Lead with the AI's own friendly summary, then append tool confirmations.
+    # ── WRITE path: dispatch tools, collect confirmations ────────────────────
+    write_outputs: list[str] = []
+    for action in write_actions:
+        output = await _dispatch_action(action)
+        if output:
+            write_outputs.append(output)
+
+    # ── READ path: fetch data → Pass 2 (LLM synthesizes natural answer) ──────
+    read_outputs: list[str] = []
+    for action in read_actions:
+        tool = action.get("tool", "").upper()
+        fetcher = _DATA_FETCHERS.get(tool)
+        if not fetcher:
+            continue
+        try:
+            result = await fetcher()
+            if not result.get("success"):
+                read_outputs.append(
+                    f"⚠️ Gagal mengambil data ({tool}): {result.get('error', 'unknown')}"
+                )
+                continue
+            raw_data: list = result.get("data", [])
+            if not raw_data:
+                read_outputs.append("📭 Belum ada data yang tersimpan.")
+                continue
+
+            # For READ_FINANCE: pass the pre-computed summary + raw records to LLM.
+            # The summary (calculated in Python) makes the LLM's job trivial — it
+            # only needs to narrate the numbers, not re-calculate them.
+            if tool == "READ_FINANCE" and "summary" in result:
+                context_data = {
+                    "summary": result["summary"],
+                    "records": raw_data,
+                }
+            else:
+                context_data = raw_data
+
+            # Pass 2 — synthesize a human-friendly answer from the pre-processed data
+            answer = await synthesize_answer(user_text, context_data)
+            read_outputs.append(answer)
+            logger.info("Second-pass synthesis done for tool=%s chat_id=%s", tool, chat_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Error in READ path for tool=%s: %s", tool, exc)
+            read_outputs.append(f"⚠️ Terjadi kesalahan saat membaca data: {exc}")
+
+    # ── Build final reply ─────────────────────────────────────────────────────
     parts: list[str] = []
-    if response_text:
-        parts.append(response_text)
-    if tool_outputs:
-        parts.append("\n".join(tool_outputs))
+    # For WRITE: lead with AI confirmation text, then tool receipts
+    if write_outputs:
+        if response_text:
+            parts.append(response_text)
+        parts.extend(write_outputs)
+    # For READ: the synthesized answer IS the reply — skip redundant response_text
+    parts.extend(read_outputs)
 
     final_reply = "\n\n".join(parts) if parts else "✅ Selesai diproses."
 
     await send_telegram_message(chat_id, final_reply)
-    logger.info("Reply sent to chat_id=%s | actions=%d", chat_id, len(actions))
+    logger.info(
+        "Reply sent to chat_id=%s | write_actions=%d read_actions=%d",
+        chat_id, len(write_actions), len(read_actions),
+    )
 
 
 # ── Webhook Endpoint ──────────────────────────────────────────────────────────

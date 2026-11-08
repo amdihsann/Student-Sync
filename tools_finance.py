@@ -40,7 +40,120 @@ def _get_worksheet() -> gspread.Worksheet:
     return spreadsheet.worksheet(_WORKSHEET_NAME)
 
 
-# ── Core Tool ─────────────────────────────────────────────────────────────────
+# ── Read ──────────────────────────────────────────────────────────────────────
+
+def _clean_nominal(raw: object) -> float:
+    """
+    Convert a Nominal value from Google Sheets to float.
+    Handles both already-numeric values and formatted strings like 'Rp 25.000'.
+    """
+    val_str = str(raw).replace("Rp", "").replace(".", "").replace(",", "").replace(" ", "").strip()
+    try:
+        return float(val_str)
+    except ValueError:
+        return 0.0
+
+
+def _build_summary(records: list[dict]) -> dict:
+    """
+    Pure-Python calculation of finance summary from a list of row dicts.
+
+    Expects each row to have:
+        Tanggal (str YYYY-MM-DD) — formatted string, NOT a serial number
+        Nominal (str or numeric) — cleaned via _clean_nominal()
+        Tipe    (str)            — "Pemasukan" or "Pengeluaran"
+    """
+    total_masuk:  float = 0.0
+    total_keluar: float = 0.0
+    # monthly breakdown: {"2026-11": {"Pemasukan": 0.0, "Pengeluaran": 0.0}, ...}
+    per_bulan: dict[str, dict[str, float]] = {}
+
+    for row in records:
+        nominal = _clean_nominal(row.get("Nominal", 0))
+        tipe    = str(row.get("Tipe") or "").strip().lower()
+        tanggal = str(row.get("Tanggal") or "")
+
+        # Aggregate totals
+        if tipe.startswith("pema"):
+            total_masuk += nominal
+        elif tipe.startswith("penge"):
+            total_keluar += nominal
+
+        # Extract YYYY-MM from formatted date string "YYYY-MM-DD"
+        bulan = tanggal[:7] if len(tanggal) >= 7 else "unknown"
+        if bulan not in per_bulan:
+            per_bulan[bulan] = {"Pemasukan": 0.0, "Pengeluaran": 0.0}
+        if tipe.startswith("pema"):
+            per_bulan[bulan]["Pemasukan"] += nominal
+        elif tipe.startswith("penge"):
+            per_bulan[bulan]["Pengeluaran"] += nominal
+
+    return {
+        "total_pemasukan":   total_masuk,
+        "total_pengeluaran": total_keluar,
+        "saldo":             total_masuk - total_keluar,
+        "per_bulan":         dict(sorted(per_bulan.items())),  # sorted chronologically
+    }
+
+
+def _get_finance_data_sync() -> tuple[list[dict], dict]:
+    """
+    Open the 'Finance' worksheet and fetch all rows using default formatting
+    so that 'Tanggal' stays as a readable string (e.g. '2026-11-08') instead
+    of a Google Sheets serial number.
+    Nominal cleaning is handled in Python by _clean_nominal().
+    Blocking — always call via asyncio.to_thread().
+    """
+    creds = Credentials.from_service_account_file(_CREDENTIALS_PATH, scopes=_SCOPES)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open(_SPREADSHEET_NAME)
+    worksheet = spreadsheet.worksheet(_WORKSHEET_NAME)
+
+    records: list[dict] = worksheet.get_all_records()  # default: FORMATTED_VALUE
+    summary: dict = _build_summary(records)
+    return records, summary
+
+
+async def get_finance_data() -> dict:
+    """
+    Async wrapper — fetch all finance records and a pre-computed summary.
+
+    Returns:
+        {"success": True,  "data": [...], "summary": {"total_pemasukan": ..., ...}}
+        {"success": False, "error": "<reason>"}
+    """
+    try:
+        records, summary = await asyncio.to_thread(_get_finance_data_sync)
+        logger.info("Fetched %d finance records. Saldo: %.0f", len(records), summary["saldo"])
+        return {"success": True, "data": records, "summary": summary}
+
+    except FileNotFoundError:
+        msg = f"credentials.json not found at '{_CREDENTIALS_PATH}'"
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except gspread.exceptions.SpreadsheetNotFound:
+        msg = f"Spreadsheet '{_SPREADSHEET_NAME}' not found. Check the name or sharing permissions."
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except gspread.exceptions.WorksheetNotFound:
+        msg = f"Worksheet '{_WORKSHEET_NAME}' not found inside '{_SPREADSHEET_NAME}'."
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except gspread.exceptions.APIError as exc:
+        msg = f"Google Sheets API error: {exc}"
+        logger.error(msg)
+        return {"success": False, "error": msg}
+
+    except Exception as exc:  # noqa: BLE001
+        msg = f"Unexpected error while fetching finance data: {exc}"
+        logger.exception(msg)
+        return {"success": False, "error": msg}
+
+
+# ── Write ─────────────────────────────────────────────────────────────────────
 
 async def append_finance_data(payload: dict) -> dict:
     """
